@@ -3946,8 +3946,13 @@ def deepseek_v3_attn_forward(
 
         kv_seq_len = value_states.shape[-2]
         if past_key_value is not None:
+            if self.layer_idx is None:
+                raise ValueError(
+                    f"The cache structure has changed since version v4.36. If you are using {self.__class__.__name__} "
+                    "for auto-regressive decoding with k/v caching, please make sure to initialize the attention class "
+                    "with a layer index."
+                )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         q_pe, k_rot = apply_rotary_pos_emb(q_pe, k_rot, cos, sin, position_ids)
 
@@ -3960,7 +3965,6 @@ def deepseek_v3_attn_forward(
         kv_cache = past_key_value
 
     k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
-
     query_states = torch.cat((q_nope, q_pe), dim=-1)
     key_states = torch.cat((k_pass, k_rot), dim=-1)
 
@@ -3999,17 +4003,15 @@ def deepseek_v3_attn_forward(
         is_causal=self.is_causal and attention_mask is None and q_len > 1,
         scale=None if not new_interface else self.scaling,
     )
-
-    if new_interface:        
-        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        return attn_output, None
     
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
 
     attn_output = self.o_proj(attn_output)
+
+    if new_interface:        
+        return attn_output, None
 
     return attn_output, None, past_key_value
 
