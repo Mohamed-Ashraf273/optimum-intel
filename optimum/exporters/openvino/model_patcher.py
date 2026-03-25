@@ -3964,6 +3964,8 @@ def deepseek_v3_attn_forward(
             key_states, value_states = kv_cache.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
+            if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+                value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
         else:
             cache_kwargs = {"sin": sin, "cos": cos}
             key_states, value_states = kv_cache.update(
@@ -3971,28 +3973,11 @@ def deepseek_v3_attn_forward(
             )
 
     if attention_mask is not None:
-        attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+            raise ValueError(
+                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+            )
 
-    # if new_interface:
-    #     key_states = repeat_kv(key_states, self.num_key_value_groups)
-    #     value_states = repeat_kv(value_states, self.num_key_value_groups)
-
-    #     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
-
-    #     if attention_mask is not None:
-    #         attn_weights = attn_weights + attention_mask
-
-    #     attn_weights = torch.nn.functional.softmax(
-    #         attn_weights, dim=-1, dtype=torch.float32
-    #     ).to(query_states.dtype)
-
-    #     attn_weights = torch.nn.functional.dropout(
-    #         attn_weights, p=self.attention_dropout, training=self.training
-    #     )
-
-    #     attn_output = torch.matmul(attn_weights, value_states)
-
-    # else:
     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
     # Reference: https://github.com/pytorch/pytorch/issues/112577.
     if query_states.device.type == "cuda" and attention_mask is not None:
@@ -4011,14 +3996,19 @@ def deepseek_v3_attn_forward(
         scale=None if not new_interface else self.scaling,
     )
 
+    if new_interface:
+        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+            attn_output = attn_output[:, :, :, : self.v_head_dim]
+        
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None
+    
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
 
     attn_output = self.o_proj(attn_output)
-
-    if new_interface:
-        return attn_output, None
 
     return attn_output, None, past_key_value
 
