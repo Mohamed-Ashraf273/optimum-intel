@@ -4003,6 +4003,10 @@ def deepseek_v3_attn_forward(
         is_causal=self.is_causal and attention_mask is None and q_len > 1,
         scale=None if not new_interface else self.scaling,
     )
+
+    if new_interface:
+        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+            attn_output = attn_output[:, :, :, : self.v_head_dim]
     
     attn_output = attn_output.transpose(1, 2).contiguous()
 
