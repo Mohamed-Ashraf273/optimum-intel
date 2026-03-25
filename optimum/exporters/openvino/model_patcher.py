@@ -19,7 +19,7 @@ import logging as log
 import math
 import types
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, Callable
 
 import torch
 import torch.nn.functional as F
@@ -3918,6 +3918,7 @@ def deepseek_v3_attn_forward(
         from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
             apply_rotary_pos_emb,
             apply_rotary_pos_emb_interleave,
+            eager_attention_forward
         )
 
         cos, sin = position_embeddings
@@ -3980,10 +3981,9 @@ def deepseek_v3_attn_forward(
     # 🔥🔥🔥 CRITICAL FIX: use HF attention interface instead of raw SDPA
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
-        self.config._attn_implementation,
-        lambda *args, **kwargs: torch.nn.functional.scaled_dot_product_attention(*args, **kwargs),
-    )
+    attention_interface: Callable = eager_attention_forward
+    if self.config._attn_implementation != "eager":
+        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
     # 🔥 FIX: flash attention padding
     if new_interface:
