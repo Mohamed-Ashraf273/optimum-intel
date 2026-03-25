@@ -3951,6 +3951,12 @@ def deepseek_v3_attn_forward(
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         q_pe, k_rot = apply_rotary_pos_emb(q_pe, k_rot, cos, sin, position_ids)
 
+        if attention_mask is not None:
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
+
         kv_cache = past_key_value
 
     k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
@@ -3970,12 +3976,6 @@ def deepseek_v3_attn_forward(
             cache_kwargs = {"sin": sin, "cos": cos}
             key_states, value_states = kv_cache.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
-            )
-
-    if attention_mask is not None:
-        if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-            raise ValueError(
-                f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
             )
 
     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
