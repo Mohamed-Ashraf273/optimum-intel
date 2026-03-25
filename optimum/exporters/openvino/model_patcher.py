@@ -3871,14 +3871,33 @@ def deepseek_v3_attn_forward(
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     # modified from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L751
+    def rotate_half(x):
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+    def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+        orig_dtype = k.dtype
+        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+        q_fp32 = q.to(dtype=torch.float32)
+        k_fp32 = k.to(dtype=torch.float32)
+        q_embed = (q_fp32 * cos) + (rotate_half(q_fp32) * sin)
+        k_embed = (k_fp32 * cos) + (rotate_half(k_fp32) * sin)
+        return q_embed.to(dtype=orig_dtype), k_embed.to(dtype=orig_dtype)
+    
     if output_attentions:
         return self._orig_forward(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
+            position_embeddings=position_embeddings,
             past_key_value=past_key_value,
+            past_key_values=past_key_values,
             output_attentions=output_attentions,
             use_cache=use_cache,
+            cache_position=cache_position,
+            kwargs=kwargs,
         )
 
     bsz, q_len, _ = hidden_states.size()
@@ -3914,10 +3933,7 @@ def deepseek_v3_attn_forward(
     new_interface = position_embeddings is not None and not hasattr(self, "rotary_emb")
 
     if new_interface:
-        from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
-            apply_rotary_pos_emb,
-            apply_rotary_pos_emb_interleave,
-        )
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave
 
         cos, sin = position_embeddings
 
@@ -3929,21 +3945,6 @@ def deepseek_v3_attn_forward(
         kv_cache = past_key_values if past_key_values is not None else past_key_value
 
     else:
-        def rotate_half(x):
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
-            orig_dtype = k.dtype
-            cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-            sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-            q_fp32 = q.to(dtype=torch.float32)
-            k_fp32 = k.to(dtype=torch.float32)
-            q_embed = (q_fp32 * cos) + (rotate_half(q_fp32) * sin)
-            k_embed = (k_fp32 * cos) + (rotate_half(k_fp32) * sin)
-            return q_embed.to(dtype=orig_dtype), k_embed.to(dtype=orig_dtype)
-
         kv_seq_len = value_states.shape[-2]
         if past_key_value is not None:
             if self.layer_idx is None:
@@ -4003,11 +4004,6 @@ def deepseek_v3_attn_forward(
         is_causal=self.is_causal and attention_mask is None and q_len > 1,
         scale=None if not new_interface else self.scaling,
     )
-
-    if new_interface:
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
-            attn_output = attn_output[:, :, :, : self.v_head_dim]
-    
     attn_output = attn_output.transpose(1, 2).contiguous()
 
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
