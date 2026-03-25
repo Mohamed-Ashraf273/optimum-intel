@@ -3979,7 +3979,17 @@ def deepseek_v3_attn_forward(
 
     # ---- attention ----
     sdpa_kwargs = {}
-    if "scale" in inspect.signature(torch.nn.functional.scaled_dot_product_attention).parameters:
+    scale_supported = False
+    try:
+        scale_supported = (
+            "scale"
+            in inspect.signature(torch.nn.functional.scaled_dot_product_attention).parameters
+        )
+    except (TypeError, ValueError):
+        # Some builds expose SDPA as a builtin without an inspectable signature.
+        scale_supported = False
+
+    if scale_supported:
         # Match HF attention scaling (incl. rope scaling like YaRN).
         sdpa_kwargs["scale"] = self.scaling
     else:
