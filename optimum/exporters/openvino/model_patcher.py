@@ -4140,14 +4140,18 @@ def deepseek_v2_attn_forward(
 
 
 def deepseek_moe_infer(self, x, topk_ids, topk_weight):
-    cnts = torch.zeros((topk_ids.shape[0], len(self.experts)))
+    cnts = torch.zeros(
+        (topk_ids.shape[0], len(self.experts)),
+        device=topk_ids.device,
+        dtype=topk_weight.dtype,
+    )
     cnts.scatter_(1, topk_ids, 1)
     tokens_per_expert = cnts.sum(dim=0).to(torch.long)
     idxs = torch.argsort(topk_ids.view(-1))
     sorted_tokens = x[idxs // topk_ids.shape[1]]
 
     outputs = []
-    start_idx = torch.tensor(0, dtype=torch.long)
+    start_idx = torch.tensor(0, device=topk_ids.device, dtype=torch.long)
     for i, num_tokens in enumerate(tokens_per_expert):
         end_idx = start_idx + num_tokens
         # difference with original: removed skiping expert if empty num_tokens
@@ -4182,10 +4186,13 @@ def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, 
     num_experts = len(self.experts)
     batch_tokens, hidden_dim = hidden_states.shape
 
+    if topk_weights.dtype != torch.float32:
+        topk_weights = topk_weights.float()
     routing = torch.zeros(
-        batch_tokens, num_experts,
+        batch_tokens,
+        num_experts,
         dtype=topk_weights.dtype,
-        device=hidden_states.device
+        device=hidden_states.device,
     )
     routing.scatter_(1, topk_indices, topk_weights)
 
