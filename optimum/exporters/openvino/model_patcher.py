@@ -4174,31 +4174,27 @@ def deepseek_moe_infer(self, x, topk_ids, topk_weight):
 
 def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
     """
-    Replacement for DeepseekV3MoE.moe (transformers >= 4.57).
-    The original skips experts with no tokens (data-dependent control flow that breaks tracing).
-    This version unconditionally runs all experts to produce a traceable static graph.
+    Vectorized MoE that matches original behavior exactly.
     """
+    orig_dtype = hidden_states.dtype
     num_experts = len(self.experts)
-    batch_tokens, hidden_dim = hidden_states.shape
-
+    batch_tokens, _ = hidden_states.shape
     routing = torch.zeros(
         batch_tokens, num_experts,
         dtype=topk_weights.dtype,
         device=hidden_states.device
     )
     routing.scatter_(1, topk_indices, topk_weights)
-
-    hidden_states = hidden_states.repeat(num_experts, 1)
-    hidden_states = hidden_states.view(num_experts, batch_tokens, hidden_dim)
+    expanded = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
     act_fn = self.experts[0].act_fn
-    gate = torch.bmm(hidden_states, self.gate_projs.transpose(1, 2))
-    up = torch.bmm(hidden_states, self.up_projs.transpose(1, 2))
+    gate = torch.bmm(expanded, self.gate_projs.transpose(1, 2))
+    up = torch.bmm(expanded, self.up_projs.transpose(1, 2))
     gate_up = act_fn(gate) * up
     next_states = torch.bmm(gate_up, self.down_projs.transpose(1, 2))
     routing = routing.transpose(0, 1).unsqueeze(-1)
     next_states = next_states * routing
     next_states = next_states.sum(dim=0)
-    return next_states.type(hidden_states.dtype)
+    return next_states.to(orig_dtype)
 
 
 class Qwen2VLLanguageModelPatcher(OVDecoderModelPatcher):
