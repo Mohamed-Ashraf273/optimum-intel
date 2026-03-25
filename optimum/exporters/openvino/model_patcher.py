@@ -3978,6 +3978,15 @@ def deepseek_v3_attn_forward(
             )
 
     # ---- attention ----
+    sdpa_kwargs = {}
+    if "scale" in inspect.signature(torch.nn.functional.scaled_dot_product_attention).parameters:
+        # Match HF attention scaling (incl. rope scaling like YaRN).
+        sdpa_kwargs["scale"] = self.scaling
+    else:
+        # Fallback for older torch: adjust query to emulate custom scaling.
+        if hasattr(self, "scaling") and self.scaling is not None:
+            query_states = query_states * (self.scaling * math.sqrt(self.qk_head_dim))
+
     attn_output = torch.nn.functional.scaled_dot_product_attention(
         query_states,
         key_states,
@@ -3985,6 +3994,7 @@ def deepseek_v3_attn_forward(
         attn_mask=attention_mask,
         dropout_p=self.attention_dropout if self.training else 0.0,
         is_causal=self.is_causal and attention_mask is None and q_len > 1,
+        **sdpa_kwargs,
     )
 
     attn_output = attn_output.transpose(1, 2).contiguous()
