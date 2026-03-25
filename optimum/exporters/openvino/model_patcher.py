@@ -3926,9 +3926,6 @@ def deepseek_v3_attn_forward(
         else:
             q_pe, k_rot = apply_rotary_pos_emb(q_pe, k_rot, cos, sin)
 
-        if attention_mask is not None:
-            attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-
         kv_cache = past_key_values if past_key_values is not None else past_key_value
 
     else:
@@ -3975,6 +3972,10 @@ def deepseek_v3_attn_forward(
             )
             if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
                 value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
+
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+                
         else:
             cache_kwargs = {"sin": sin, "cos": cos}
             key_states, value_states = kv_cache.update(
