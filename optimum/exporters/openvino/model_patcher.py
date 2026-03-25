@@ -3973,42 +3973,43 @@ def deepseek_v3_attn_forward(
     if attention_mask is not None:
         attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
-    if new_interface:
-        key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
+    # if new_interface:
+    #     key_states = repeat_kv(key_states, self.num_key_value_groups)
+    #     value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+    #     attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
 
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
+    #     if attention_mask is not None:
+    #         attn_weights = attn_weights + attention_mask
 
-        attn_weights = torch.nn.functional.softmax(
-            attn_weights, dim=-1, dtype=torch.float32
-        ).to(query_states.dtype)
+    #     attn_weights = torch.nn.functional.softmax(
+    #         attn_weights, dim=-1, dtype=torch.float32
+    #     ).to(query_states.dtype)
 
-        attn_weights = torch.nn.functional.dropout(
-            attn_weights, p=self.attention_dropout, training=self.training
-        )
+    #     attn_weights = torch.nn.functional.dropout(
+    #         attn_weights, p=self.attention_dropout, training=self.training
+    #     )
 
-        attn_output = torch.matmul(attn_weights, value_states)
+    #     attn_output = torch.matmul(attn_weights, value_states)
 
-    else:
-        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
-        # Reference: https://github.com/pytorch/pytorch/issues/112577.
-        if query_states.device.type == "cuda" and attention_mask is not None:
-            query_states = query_states.contiguous()
-            key_states = key_states.contiguous()
-            value_states = value_states.contiguous()
+    # else:
+    # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+    # Reference: https://github.com/pytorch/pytorch/issues/112577.
+    if query_states.device.type == "cuda" and attention_mask is not None:
+        query_states = query_states.contiguous()
+        key_states = key_states.contiguous()
+        value_states = value_states.contiguous()
 
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask,
-            dropout_p=self.attention_dropout if self.training else 0.0,
-            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
-            is_causal=self.is_causal and attention_mask is None and q_len > 1,
-        )
+    attn_output = torch.nn.functional.scaled_dot_product_attention(
+        query_states,
+        key_states,
+        value_states,
+        attn_mask=attention_mask,
+        dropout_p=self.attention_dropout if self.training else 0.0,
+        # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+        is_causal=self.is_causal and attention_mask is None and q_len > 1,
+        scale=None if not new_interface else self.scaling,
+    )
 
     attn_output = attn_output.transpose(1, 2).contiguous()
 
