@@ -3978,6 +3978,10 @@ def deepseek_v3_attn_forward(
             )
 
     # ---- attention ----
+    if attention_mask is not None:
+        # Match HF eager path: slice mask to current kv length.
+        attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
     sdpa_kwargs = {}
     scale_supported = False
     try:
