@@ -19,7 +19,7 @@ import logging as log
 import math
 import types
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, Callable
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -3890,7 +3890,6 @@ def deepseek_v3_attn_forward(
 
     q = q.view(bsz, q_len, self.num_heads, self.qk_head_dim).transpose(1, 2)
     q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
     compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 
     k_pass, k_rot = torch.split(
@@ -3918,12 +3917,10 @@ def deepseek_v3_attn_forward(
         from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
             apply_rotary_pos_emb,
             apply_rotary_pos_emb_interleave,
-            eager_attention_forward
         )
 
         cos, sin = position_embeddings
 
-        # 🔥 FIX: exact HF behavior
         if getattr(self.config, "rope_interleave", False):
             q_pe, k_rot = apply_rotary_pos_emb_interleave(q_pe, k_rot, cos, sin)
         else:
@@ -3964,10 +3961,9 @@ def deepseek_v3_attn_forward(
 
     if kv_cache is not None:
         if new_interface:
-            # 🔥 FIX: correct cache API (no kwargs)
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = kv_cache.update(
-                key_states, value_states, self.layer_idx
+                key_states, value_states, self.layer_idx, cache_kwargs
             )
         else:
             cache_kwargs = {"sin": cos, "cos": sin}
@@ -3978,34 +3974,21 @@ def deepseek_v3_attn_forward(
     if attention_mask is not None:
         attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
-    # 🔥🔥🔥 CRITICAL FIX: use HF attention interface instead of raw SDPA
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
-
-    attention_interface: Callable = eager_attention_forward
-    if self.config._attn_implementation != "eager":
-        attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-    # 🔥 FIX: flash attention padding
-    if new_interface:
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
-            value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
-
-    attn_output, _ = attention_interface(
-        self,
-        query_states,
-        key_states,
-        value_states,
-        attention_mask,
-        dropout=0.0 if not self.training else self.attention_dropout,
-        scaling=self.scaling,
+    # Match HF eager attention math for the new interface.
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = torch.nn.functional.dropout(
+        attn_weights, p=self.attention_dropout, training=self.training
     )
-
-    if new_interface:
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
-            attn_output = attn_output[:, :, :, : self.v_head_dim]
-
+    attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
+
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+
     attn_output = self.o_proj(attn_output)
 
     if new_interface:
