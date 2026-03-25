@@ -3929,7 +3929,6 @@ def deepseek_v3_attn_forward(
         kv_cache = past_key_values if past_key_values is not None else past_key_value
 
     else:
-        # legacy path (keep as is)
         def rotate_half(x):
             x1 = x[..., : x.shape[-1] // 2]
             x2 = x[..., x.shape[-1] // 2 :]
@@ -3994,6 +3993,8 @@ def deepseek_v3_attn_forward(
         attn_output = torch.matmul(attn_weights, value_states)
 
     else:
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
         if query_states.device.type == "cuda" and attention_mask is not None:
             query_states = query_states.contiguous()
             key_states = key_states.contiguous()
@@ -4005,6 +4006,7 @@ def deepseek_v3_attn_forward(
             value_states,
             attn_mask=attention_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
+            # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
             is_causal=self.is_causal and attention_mask is None and q_len > 1,
         )
 
