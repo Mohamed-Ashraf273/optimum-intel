@@ -3918,7 +3918,6 @@ def deepseek_v3_attn_forward(
         from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
             apply_rotary_pos_emb,
             apply_rotary_pos_emb_interleave,
-            is_flash_attention_requested,
         )
 
         cos, sin = position_embeddings
@@ -3979,7 +3978,7 @@ def deepseek_v3_attn_forward(
         attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
     # 🔥🔥🔥 CRITICAL FIX: use HF attention interface instead of raw SDPA
-    from transformers.masking_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
     attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
         self.config._attn_implementation,
@@ -3988,7 +3987,7 @@ def deepseek_v3_attn_forward(
 
     # 🔥 FIX: flash attention padding
     if new_interface:
-        if is_flash_attention_requested(self.config) and self.qk_head_dim != self.v_head_dim:
+        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
             value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
 
     attn_output, _ = attention_interface(
@@ -4002,7 +4001,7 @@ def deepseek_v3_attn_forward(
     )
 
     if new_interface:
-        if is_flash_attention_requested(self.config) and self.qk_head_dim != self.v_head_dim:
+        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
             attn_output = attn_output[:, :, :, : self.v_head_dim]
 
     attn_output = attn_output.transpose(1, 2).contiguous()
