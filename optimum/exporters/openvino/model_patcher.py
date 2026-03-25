@@ -3872,9 +3872,9 @@ def deepseek_v3_attn_forward(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     # modified from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L751
     def rotate_half(x):
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
+        x1 = x[..., : x.shape[-1] // 2]
+        x2 = x[..., x.shape[-1] // 2 :]
+        return torch.cat((-x2, x1), dim=-1)
 
     def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
         orig_dtype = k.dtype
@@ -3885,7 +3885,7 @@ def deepseek_v3_attn_forward(
         q_embed = (q_fp32 * cos) + (rotate_half(q_fp32) * sin)
         k_embed = (k_fp32 * cos) + (rotate_half(k_fp32) * sin)
         return q_embed.to(dtype=orig_dtype), k_embed.to(dtype=orig_dtype)
-    
+
     if output_attentions:
         return self._orig_forward(
             hidden_states=hidden_states,
@@ -3918,9 +3918,7 @@ def deepseek_v3_attn_forward(
     )
 
     k_pass = self.kv_b_proj(self.kv_a_layernorm(k_pass))
-    k_pass = k_pass.view(
-        bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-    ).transpose(1, 2)
+    k_pass = k_pass.view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
 
     k_pass, value_states = torch.split(
         k_pass,
@@ -3972,20 +3970,14 @@ def deepseek_v3_attn_forward(
     if kv_cache is not None:
         if new_interface:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = kv_cache.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
-            if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
-                value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
+            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
             if attention_mask is not None:
                 attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
         else:
             cache_kwargs = {"sin": sin, "cos": cos}
-            key_states, value_states = kv_cache.update(
-                key_states, value_states, self.layer_idx, cache_kwargs
-            )
+            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
     # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -4010,7 +4002,7 @@ def deepseek_v3_attn_forward(
 
     attn_output = self.o_proj(attn_output)
 
-    if new_interface:        
+    if new_interface:
         return attn_output, None
 
     return attn_output, None, past_key_value
@@ -4174,16 +4166,12 @@ def deepseek_moe_infer(self, x, topk_ids, topk_weight):
 
 def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, topk_weights: torch.Tensor):
     """
-    Vectorized MoE that matches original behavior exactly.
+    Vectorized MoE that matches original behavior.
     """
     orig_dtype = hidden_states.dtype
     num_experts = len(self.experts)
     batch_tokens, _ = hidden_states.shape
-    routing = torch.zeros(
-        batch_tokens, num_experts,
-        dtype=topk_weights.dtype,
-        device=hidden_states.device
-    )
+    routing = torch.zeros(batch_tokens, num_experts, dtype=topk_weights.dtype, device=hidden_states.device)
     routing.scatter_(1, topk_indices, topk_weights)
     expanded = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
     act_fn = self.experts[0].act_fn
