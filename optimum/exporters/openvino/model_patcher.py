@@ -3975,7 +3975,7 @@ def deepseek_v3_attn_forward(
 
             if attention_mask is not None:
                 attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-                
+
         else:
             cache_kwargs = {"sin": sin, "cos": cos}
             key_states, value_states = kv_cache.update(
@@ -4000,10 +4000,7 @@ def deepseek_v3_attn_forward(
         scale=None if not new_interface else self.scaling,
     )
 
-    if new_interface:
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
-            attn_output = attn_output[:, :, :, : self.v_head_dim]
-        
+    if new_interface:        
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, None
