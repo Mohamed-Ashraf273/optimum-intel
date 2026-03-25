@@ -4187,20 +4187,24 @@ def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, 
     num_experts = len(self.experts)
     batch_tokens, hidden_dim = hidden_states.shape
 
+    if topk_weights.dtype != torch.float32:
+        topk_weights = topk_weights.float()
     routing = torch.zeros(
-        batch_tokens, num_experts,
+        batch_tokens,
+        num_experts,
         dtype=topk_weights.dtype,
-        device=hidden_states.device
+        device=hidden_states.device,
     )
     routing.scatter_(1, topk_indices, topk_weights)
 
     hidden_states = hidden_states.repeat(num_experts, 1)
     hidden_states = hidden_states.view(num_experts, batch_tokens, hidden_dim)
+    hs_fp32 = hidden_states.float()
     act_fn = self.experts[0].act_fn
-    gate = torch.bmm(hidden_states, self.gate_projs.transpose(1, 2))
-    up = torch.bmm(hidden_states, self.up_projs.transpose(1, 2))
+    gate = torch.bmm(hs_fp32, self.gate_projs.transpose(1, 2).float())
+    up = torch.bmm(hs_fp32, self.up_projs.transpose(1, 2).float())
     gate_up = act_fn(gate) * up
-    next_states = torch.bmm(gate_up, self.down_projs.transpose(1, 2))
+    next_states = torch.bmm(gate_up, self.down_projs.transpose(1, 2).float())
     routing = routing.transpose(0, 1).unsqueeze(-1)
     next_states = next_states * routing
     next_states = next_states.sum(dim=0)
