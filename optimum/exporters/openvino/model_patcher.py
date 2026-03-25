@@ -3870,7 +3870,7 @@ def deepseek_v3_attn_forward(
     use_cache: bool = False,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
+    # modified from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L751
     if output_attentions:
         return self._orig_forward(
             hidden_states=hidden_states,
@@ -3883,7 +3883,6 @@ def deepseek_v3_attn_forward(
 
     bsz, q_len, _ = hidden_states.size()
 
-    # ---- Q ----
     if self.q_lora_rank is None:
         q = self.q_proj(hidden_states)
     else:
@@ -3891,11 +3890,8 @@ def deepseek_v3_attn_forward(
 
     q = q.view(bsz, q_len, self.num_heads, self.qk_head_dim).transpose(1, 2)
     q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-
-    # ---- KV ----
     compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 
-    # 🔥 FIX: match HF naming/logic
     k_pass, k_rot = torch.split(
         compressed_kv,
         [self.kv_lora_rank, self.qk_rope_head_dim],
@@ -3915,7 +3911,6 @@ def deepseek_v3_attn_forward(
 
     k_rot = k_rot.view(bsz, 1, q_len, self.qk_rope_head_dim)
 
-    # ---- RoPE ----
     new_interface = position_embeddings is not None and not hasattr(self, "rotary_emb")
 
     if new_interface:
@@ -3959,17 +3954,16 @@ def deepseek_v3_attn_forward(
 
         kv_cache = past_key_value
 
-    # ---- merge ----
     k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
     query_states = torch.cat((q_nope, q_pe), dim=-1)
     key_states = torch.cat((k_pass, k_rot), dim=-1)
 
-    # ---- cache ----
     if kv_cache is not None:
         if new_interface:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = kv_cache.update(
-                key_states, value_states, self.layer_idx
+                key_states, value_states, self.layer_idx, cache_kwargs
             )
         else:
             cache_kwargs = {"sin": cos, "cos": sin}
@@ -3977,42 +3971,24 @@ def deepseek_v3_attn_forward(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-    # ---- attention ----
     if attention_mask is not None:
-        # Match HF eager path: slice mask to current kv length.
         attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
 
-    sdpa_kwargs = {}
-    scale_supported = False
-    try:
-        scale_supported = (
-            "scale"
-            in inspect.signature(torch.nn.functional.scaled_dot_product_attention).parameters
-        )
-    except (TypeError, ValueError):
-        # Some builds expose SDPA as a builtin without an inspectable signature.
-        scale_supported = False
-
-    if scale_supported:
-        # Match HF attention scaling (incl. rope scaling like YaRN).
-        sdpa_kwargs["scale"] = self.scaling
-    else:
-        # Fallback for older torch: adjust query to emulate custom scaling.
-        if hasattr(self, "scaling") and self.scaling is not None:
-            query_states = query_states * (self.scaling * math.sqrt(self.qk_head_dim))
-
-    attn_output = torch.nn.functional.scaled_dot_product_attention(
-        query_states,
-        key_states,
-        value_states,
-        attn_mask=attention_mask,
-        dropout_p=self.attention_dropout if self.training else 0.0,
-        is_causal=self.is_causal and attention_mask is None and q_len > 1,
-        **sdpa_kwargs,
+    # Match HF eager attention math for the new interface.
+    key_states = repeat_kv(key_states, self.num_key_value_groups)
+    value_states = repeat_kv(value_states, self.num_key_value_groups)
+    attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * self.scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+    attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    attn_weights = torch.nn.functional.dropout(
+        attn_weights, p=self.attention_dropout, training=self.training
     )
-
+    attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
+
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+
     attn_output = self.o_proj(attn_output)
 
     if new_interface:
@@ -4144,18 +4120,14 @@ def deepseek_v2_attn_forward(
 
 
 def deepseek_moe_infer(self, x, topk_ids, topk_weight):
-    cnts = torch.zeros(
-        (topk_ids.shape[0], len(self.experts)),
-        device=topk_ids.device,
-        dtype=topk_weight.dtype,
-    )
+    cnts = torch.zeros((topk_ids.shape[0], len(self.experts)))
     cnts.scatter_(1, topk_ids, 1)
     tokens_per_expert = cnts.sum(dim=0).to(torch.long)
     idxs = torch.argsort(topk_ids.view(-1))
     sorted_tokens = x[idxs // topk_ids.shape[1]]
 
     outputs = []
-    start_idx = torch.tensor(0, device=topk_ids.device, dtype=torch.long)
+    start_idx = torch.tensor(0, dtype=torch.long)
     for i, num_tokens in enumerate(tokens_per_expert):
         end_idx = start_idx + num_tokens
         # difference with original: removed skiping expert if empty num_tokens
@@ -4190,13 +4162,10 @@ def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, 
     num_experts = len(self.experts)
     batch_tokens, hidden_dim = hidden_states.shape
 
-    if topk_weights.dtype != torch.float32:
-        topk_weights = topk_weights.float()
     routing = torch.zeros(
-        batch_tokens,
-        num_experts,
+        batch_tokens, num_experts,
         dtype=topk_weights.dtype,
-        device=hidden_states.device,
+        device=hidden_states.device
     )
     routing.scatter_(1, topk_indices, topk_weights)
 
