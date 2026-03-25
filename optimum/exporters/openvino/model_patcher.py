@@ -3926,6 +3926,9 @@ def deepseek_v3_attn_forward(
         else:
             q_pe, k_rot = apply_rotary_pos_emb(q_pe, k_rot, cos, sin)
 
+        if attention_mask is not None:
+            attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
         kv_cache = past_key_values if past_key_values is not None else past_key_value
 
     else:
