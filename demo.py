@@ -83,12 +83,32 @@ def debug_deepseek_v3_attention_forward(
     k_pass, value_states = torch.split(k_pass, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
     k_rot = k_rot.view(batch_size, 1, seq_length, self.qk_rope_head_dim)
+    _upstream_deepseek_v3_debug_trace(
+        self,
+        "attn_proj",
+        hidden_states=hidden_states,
+        q=q_states,
+        q_nope=q_pass,
+        q_pe_pre_rope=q_rot,
+        compressed_kv=compressed_kv,
+        k_pass=k_pass,
+        k_rot_pre_rope=k_rot,
+        value_states=value_states,
+    )
 
     cos, sin = position_embeddings
     if self.config.rope_interleave:
         q_rot, k_rot = apply_rotary_pos_emb_interleave(q_rot, k_rot, cos, sin)
     else:
         q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin)
+    _upstream_deepseek_v3_debug_trace(
+        self,
+        "attn_rope",
+        cos=cos,
+        sin=sin,
+        q_pe=q_rot,
+        k_rot=k_rot,
+    )
     k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
     query_states = torch.cat((q_pass, q_rot), dim=-1)
@@ -132,12 +152,21 @@ def debug_deepseek_v3_attention_forward(
         scaling=self.scaling,
         **kwargs,
     )
+    _upstream_deepseek_v3_debug_trace(
+        self,
+        "attn_sdpa_inputs",
+        query_states=query_states,
+        key_states=key_states,
+        value_states=value_states,
+        attention_mask=attention_mask,
+    )
 
     if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
         attn_output = attn_output[:, :, :, : self.v_head_dim]
 
-    _upstream_deepseek_v3_debug_trace(self, "attn_output_pre_proj", attn_output=attn_output)
+    _upstream_deepseek_v3_debug_trace(self, "attn_output_pre_transpose", attn_output=attn_output)
     attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
+    _upstream_deepseek_v3_debug_trace(self, "attn_output_pre_proj", attn_output=attn_output)
     attn_output = self.o_proj(attn_output)
     _upstream_deepseek_v3_debug_trace(self, "attn_output_post_proj", attn_output=attn_output)
     return attn_output, attn_weights
@@ -486,7 +515,16 @@ def compare_export_attention_paths(
     print(f"Detailed tensor diffs for layer {layer_idx}:")
     upstream_layer = upstream_recorder.data.get(layer_idx, {})
     patched_layer = patched_recorder.data.get(layer_idx, {})
-    for stage in ("attn_inputs", "after_cache", "attn_output_pre_proj", "attn_output_post_proj"):
+    for stage in (
+        "attn_proj",
+        "attn_rope",
+        "attn_inputs",
+        "after_cache",
+        "attn_sdpa_inputs",
+        "attn_output_pre_transpose",
+        "attn_output_pre_proj",
+        "attn_output_post_proj",
+    ):
         upstream_stage = upstream_layer.get(stage, {})
         patched_stage = patched_layer.get(stage, {})
         keys = sorted(set(upstream_stage) & set(patched_stage))

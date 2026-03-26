@@ -79,7 +79,14 @@ if TYPE_CHECKING:
     from optimum.exporters.onnx.config import OnnxConfig
 
 
+DEEPSEEK_V3_DEBUG_HOOK = None
 DEEPSEEK_MOE_DEBUG_HOOK = None
+
+
+def _deepseek_v3_debug_trace(module, stage: str, **tensors):
+    if DEEPSEEK_V3_DEBUG_HOOK is None:
+        return
+    DEEPSEEK_V3_DEBUG_HOOK(module=module, stage=stage, tensors=tensors)
 
 
 def _deepseek_moe_debug_trace(module, stage: str, **tensors):
@@ -3934,6 +3941,18 @@ def deepseek_v3_attn_forward(
     )
 
     k_rot = k_rot.view(bsz, 1, q_len, self.qk_rope_head_dim)
+    _deepseek_v3_debug_trace(
+        self,
+        "attn_proj",
+        hidden_states=hidden_states,
+        q=q,
+        q_nope=q_nope,
+        q_pe_pre_rope=q_pe,
+        compressed_kv=compressed_kv,
+        k_pass=k_pass,
+        k_rot_pre_rope=k_rot,
+        value_states=value_states,
+    )
 
     new_interface = position_embeddings is not None and not hasattr(self, "rotary_emb")
 
@@ -3955,6 +3974,14 @@ def deepseek_v3_attn_forward(
                 )
         else:
             q_pe, k_rot = deepseek_v3_apply_rotary_pos_emb(q_pe, k_rot, cos, sin)
+        _deepseek_v3_debug_trace(
+            self,
+            "attn_rope",
+            cos=cos,
+            sin=sin,
+            q_pe=q_pe,
+            k_rot=k_rot,
+        )
 
         kv_cache = past_key_values if past_key_values is not None else past_key_value
 
@@ -3978,10 +4005,30 @@ def deepseek_v3_attn_forward(
                 )
 
         kv_cache = past_key_value
+        _deepseek_v3_debug_trace(
+            self,
+            "attn_rope",
+            cos=cos,
+            sin=sin,
+            q_pe=q_pe,
+            k_rot=k_rot,
+        )
 
     k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
     query_states = torch.cat((q_nope, q_pe), dim=-1)
     key_states = torch.cat((k_pass, k_rot), dim=-1)
+    _deepseek_v3_debug_trace(
+        self,
+        "attn_inputs",
+        q_nope=q_nope,
+        q_pe=q_pe,
+        k_pass=k_pass,
+        k_rot=k_rot,
+        query_states=query_states,
+        key_states=key_states,
+        value_states=value_states,
+        attention_mask=attention_mask,
+    )
 
     if kv_cache is not None:
         if new_interface:
@@ -3994,6 +4041,13 @@ def deepseek_v3_attn_forward(
         else:
             cache_kwargs = {"sin": sin, "cos": cos}
             key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        _deepseek_v3_debug_trace(
+            self,
+            "after_cache",
+            key_states=key_states,
+            value_states=value_states,
+            attention_mask=attention_mask,
+        )
 
     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
     # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -4001,6 +4055,15 @@ def deepseek_v3_attn_forward(
         query_states = query_states.contiguous()
         key_states = key_states.contiguous()
         value_states = value_states.contiguous()
+
+    _deepseek_v3_debug_trace(
+        self,
+        "attn_sdpa_inputs",
+        query_states=query_states,
+        key_states=key_states,
+        value_states=value_states,
+        attention_mask=attention_mask,
+    )
 
     attn_output = torch.nn.functional.scaled_dot_product_attention(
         query_states,
@@ -4012,12 +4075,15 @@ def deepseek_v3_attn_forward(
         is_causal=self.is_causal and attention_mask is None and q_len > 1,
         scale=None if not new_interface else self.scaling,
     )
+    _deepseek_v3_debug_trace(self, "attn_output_pre_transpose", attn_output=attn_output)
 
     attn_output = attn_output.transpose(1, 2).contiguous()
+    _deepseek_v3_debug_trace(self, "attn_output_pre_proj", attn_output=attn_output)
 
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
 
     attn_output = self.o_proj(attn_output)
+    _deepseek_v3_debug_trace(self, "attn_output_post_proj", attn_output=attn_output)
 
     if new_interface:
         return attn_output, None
@@ -4188,11 +4254,7 @@ def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, 
     orig_dtype = hidden_states.dtype
     num_experts = len(self.experts)
     batch_tokens, _ = hidden_states.shape
-    # Match the original per-expert path more closely by doing the vectorized
-    # expert math and reduction in fp32, then casting back at the end.
-    compute_dtype = torch.float32 if hidden_states.is_floating_point() else torch.promote_types(
-        hidden_states.dtype, self.gate_projs.dtype
-    )
+    compute_dtype = torch.promote_types(hidden_states.dtype, self.gate_projs.dtype)
     routing = torch.zeros(batch_tokens, num_experts, dtype=compute_dtype, device=hidden_states.device)
     routing.scatter_(1, topk_indices, topk_weights.to(dtype=compute_dtype))
     expanded = hidden_states.to(dtype=compute_dtype).unsqueeze(0).expand(num_experts, -1, -1)
