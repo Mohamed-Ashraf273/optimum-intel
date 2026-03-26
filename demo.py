@@ -167,8 +167,8 @@ def debug_deepseek_v3_attention_forward(
     # Upstream attention helpers return [batch, seq, heads, dim], while the
     # patched SDPA path exposes [batch, heads, seq, dim] before transpose.
     _upstream_deepseek_v3_debug_trace(self, "attn_output_pre_transpose", attn_output=attn_output.transpose(1, 2))
-    attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
     _upstream_deepseek_v3_debug_trace(self, "attn_output_pre_proj", attn_output=attn_output)
+    attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
     attn_output = self.o_proj(attn_output)
     _upstream_deepseek_v3_debug_trace(self, "attn_output_post_proj", attn_output=attn_output)
     return attn_output, attn_weights
