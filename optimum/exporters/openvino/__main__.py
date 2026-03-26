@@ -553,7 +553,7 @@ def main_export(
 
         # TODO: Remove GPT-OSS workaround when possible
         quantization_config = None if ov_config is None else ov_config.quantization_config
-        if not quantization_config or isinstance(quantization_config, _GPTOSSQuantizationConfig):
+        if ov_config is None or isinstance(quantization_config, _GPTOSSQuantizationConfig):
             _apply_model_size_based_quantization(submodel_paths, ov_config, output)
     finally:
         # Unpatch modules after quantized model export

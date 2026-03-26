@@ -3861,45 +3861,6 @@ class DeepseekPatcher(OVDecoderModelPatcher):
                 delattr(block.mlp, "_orig_moe_infer")
 
 
-def _deepseek_v3_rotate_half(x):
-    """Rotates half the hidden dims of the input."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def _deepseek_v3_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    q_dtype = q.dtype
-    k_dtype = k.dtype
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q = q.to(torch.float32)
-    k = k.to(torch.float32)
-    q_embed = (q * cos) + (_deepseek_v3_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_deepseek_v3_rotate_half(k) * sin)
-    return q_embed.to(q_dtype), k_embed.to(k_dtype)
-
-
-def _deepseek_v3_apply_rotary_pos_emb_interleave(q, k, cos, sin, unsqueeze_dim=1):
-    q_dtype = q.dtype
-    k_dtype = k.dtype
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-
-    q = q.to(torch.float32)
-    k = k.to(torch.float32)
-
-    b, h, s, d = q.shape
-    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-    b, h, s, d = k.shape
-    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
-
-    q_embed = (q * cos) + (_deepseek_v3_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_deepseek_v3_rotate_half(k) * sin)
-    return q_embed.to(q_dtype), k_embed.to(k_dtype)
-
-
 def deepseek_v3_attn_forward(
     self,
     hidden_states: torch.Tensor,
