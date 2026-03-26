@@ -3979,11 +3979,9 @@ def deepseek_v3_attn_forward(
     if kv_cache is not None:
         if new_interface:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
-
         else:
             cache_kwargs = {"sin": sin, "cos": cos}
-            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
     # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -4000,7 +3998,7 @@ def deepseek_v3_attn_forward(
         if self.config._attn_implementation != "eager":
             attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-        attn_output, attn_weights = attention_interface(
+        attn_output, _ = attention_interface(
             self,
             query_states,
             key_states,
