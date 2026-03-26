@@ -3854,6 +3854,45 @@ class DeepseekPatcher(OVDecoderModelPatcher):
                 delattr(block.mlp, "_orig_moe_infer")
 
 
+def _deepseek_v3_rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _deepseek_v3_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    q_dtype = q.dtype
+    k_dtype = k.dtype
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q = q.to(torch.float32)
+    k = k.to(torch.float32)
+    q_embed = (q * cos) + (_deepseek_v3_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_deepseek_v3_rotate_half(k) * sin)
+    return q_embed.to(q_dtype), k_embed.to(k_dtype)
+
+
+def _deepseek_v3_apply_rotary_pos_emb_interleave(q, k, cos, sin, unsqueeze_dim=1):
+    q_dtype = q.dtype
+    k_dtype = k.dtype
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    q = q.to(torch.float32)
+    k = k.to(torch.float32)
+
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    q_embed = (q * cos) + (_deepseek_v3_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_deepseek_v3_rotate_half(k) * sin)
+    return q_embed.to(q_dtype), k_embed.to(k_dtype)
+
+
 def deepseek_v3_attn_forward(
     self,
     hidden_states: torch.Tensor,
@@ -3929,25 +3968,20 @@ def deepseek_v3_attn_forward(
     new_interface = position_embeddings is not None and not hasattr(self, "rotary_emb")
 
     if new_interface:
-        from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
-            ALL_ATTENTION_FUNCTIONS,
-            apply_rotary_pos_emb,
-            apply_rotary_pos_emb_interleave,
-            eager_attention_forward,
-        )
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import ALL_ATTENTION_FUNCTIONS, eager_attention_forward
 
         cos, sin = position_embeddings
 
         if getattr(self.config, "rope_interleave", False):
             try:
-                q_pe, k_rot = apply_rotary_pos_emb_interleave(q_pe, k_rot, cos, sin)
+                q_pe, k_rot = _deepseek_v3_apply_rotary_pos_emb_interleave(q_pe, k_rot, cos, sin)
             except Exception as e:
                 raise RuntimeError(
                     "Failed to apply interleaved rotary position embeddings, "
                     f"may due to incompatible transformers version, try to `pip install transformers>=4.57.1`: {e}"
                 )
         else:
-            q_pe, k_rot = apply_rotary_pos_emb(q_pe, k_rot, cos, sin)
+            q_pe, k_rot = _deepseek_v3_apply_rotary_pos_emb(q_pe, k_rot, cos, sin)
 
         kv_cache = past_key_values if past_key_values is not None else past_key_value
 
@@ -4196,6 +4230,7 @@ def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, 
     orig_dtype = hidden_states.dtype
     num_experts = len(self.experts)
     batch_tokens, _ = hidden_states.shape
+    hidden_states = hidden_states.to(self.gate_projs.dtype)
     routing = torch.zeros(batch_tokens, num_experts, dtype=topk_weights.dtype, device=hidden_states.device)
     routing.scatter_(1, topk_indices, topk_weights)
     expanded = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
@@ -4205,7 +4240,7 @@ def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, 
     gate_up = act_fn(gate) * up
     next_states = torch.bmm(gate_up, self.down_projs.transpose(1, 2))
     routing = routing.transpose(0, 1).unsqueeze(-1)
-    next_states = next_states * routing
+    next_states = next_states.to(topk_weights.dtype) * routing
     next_states = next_states.sum(dim=0)
     return next_states.to(orig_dtype)
 
