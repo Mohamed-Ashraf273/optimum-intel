@@ -85,6 +85,13 @@ else:
 
 
 logger = logging.getLogger(__name__)
+DEEPSEEK_V3_DEBUG_HOOK = None
+
+
+def _deepseek_v3_debug_trace(module, stage: str, **tensors):
+    if DEEPSEEK_V3_DEBUG_HOOK is None:
+        return
+    DEEPSEEK_V3_DEBUG_HOOK(module=module, stage=stage, tensors=tensors)
 
 
 for idx, spec in enumerate(UNSUPPORTED_OPS_PATCHING_SPEC):
@@ -4009,6 +4016,17 @@ def deepseek_v3_attn_forward(
     k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
     query_states = torch.cat((q_nope, q_pe), dim=-1)
     key_states = torch.cat((k_pass, k_rot), dim=-1)
+    _deepseek_v3_debug_trace(
+        self,
+        "attn_inputs",
+        q_nope=q_nope,
+        q_pe=q_pe,
+        k_pass=k_pass,
+        k_rot=k_rot,
+        query_states=query_states,
+        key_states=key_states,
+        value_states=value_states,
+    )
 
     if kv_cache is not None:
         if new_interface:
@@ -4016,6 +4034,12 @@ def deepseek_v3_attn_forward(
         else:
             cache_kwargs = {"sin": sin, "cos": cos}
         key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        _deepseek_v3_debug_trace(
+            self,
+            "after_cache",
+            key_states=key_states,
+            value_states=value_states,
+        )
 
     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
     # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -4046,8 +4070,10 @@ def deepseek_v3_attn_forward(
         if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
             attn_output = attn_output[:, :, :, : self.v_head_dim]
 
+        _deepseek_v3_debug_trace(self, "attn_output_pre_proj", attn_output=attn_output)
         attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+        _deepseek_v3_debug_trace(self, "attn_output_post_proj", attn_output=attn_output)
         return attn_output, None
 
     attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -4060,9 +4086,11 @@ def deepseek_v3_attn_forward(
         is_causal=self.is_causal and attention_mask is None and q_len > 1,
     )
 
+    _deepseek_v3_debug_trace(self, "attn_output_pre_proj", attn_output=attn_output)
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
     attn_output = self.o_proj(attn_output)
+    _deepseek_v3_debug_trace(self, "attn_output_post_proj", attn_output=attn_output)
 
     return attn_output, None, past_key_value
 
