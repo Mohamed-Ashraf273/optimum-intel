@@ -3981,14 +3981,14 @@ def deepseek_v3_attn_forward(
 
         if getattr(self.config, "rope_interleave", False):
             try:
-                q_pe, k_rot = _deepseek_v3_apply_rotary_pos_emb_interleave(q_pe, k_rot, cos, sin)
+                q_pe, k_rot = apply_rotary_pos_emb_interleave(q_pe, k_rot, cos, sin)
             except Exception as e:
                 raise RuntimeError(
                     "Failed to apply interleaved rotary position embeddings, "
                     f"may due to incompatible transformers version, try to `pip install transformers>=4.57.1`: {e}"
                 )
         else:
-            q_pe, k_rot = _deepseek_v3_apply_rotary_pos_emb(q_pe, k_rot, cos, sin)
+            q_pe, k_rot = apply_rotary_pos_emb(q_pe, k_rot, cos, sin)
 
         kv_cache = past_key_values if past_key_values is not None else past_key_value
 
