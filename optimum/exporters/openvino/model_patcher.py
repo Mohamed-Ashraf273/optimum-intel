@@ -3962,7 +3962,7 @@ def deepseek_v3_attn_forward(
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        q_pe, k_rot = apply_rotary_pos_emb_legacy(q_pe, k_rot, cos, sin, position_ids)
+        q_pe, k_rot = apply_rotary_pos_emb(q_pe, k_rot, cos, sin, position_ids)
 
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
