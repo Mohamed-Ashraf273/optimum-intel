@@ -164,7 +164,9 @@ def debug_deepseek_v3_attention_forward(
     if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
         attn_output = attn_output[:, :, :, : self.v_head_dim]
 
-    _upstream_deepseek_v3_debug_trace(self, "attn_output_pre_transpose", attn_output=attn_output)
+    # Upstream attention helpers return [batch, seq, heads, dim], while the
+    # patched SDPA path exposes [batch, heads, seq, dim] before transpose.
+    _upstream_deepseek_v3_debug_trace(self, "attn_output_pre_transpose", attn_output=attn_output.transpose(1, 2))
     attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
     _upstream_deepseek_v3_debug_trace(self, "attn_output_pre_proj", attn_output=attn_output)
     attn_output = self.o_proj(attn_output)
