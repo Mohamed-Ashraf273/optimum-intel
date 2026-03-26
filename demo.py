@@ -330,6 +330,53 @@ def _use_export_moe_debug(model, recorder: AttentionTraceRecorder):
         ov_model_patcher.DEEPSEEK_MOE_DEBUG_HOOK = old_export_hook
 
 
+@contextlib.contextmanager
+def _use_export_pytorch_patches(model):
+    patched_attn = []
+    patched_moe = []
+    try:
+        ov_model_patcher.patch_cos_sin_cached_fp32(model)
+        if hasattr(model, "model"):
+            ov_model_patcher.patch_cos_sin_cached_fp32(model.model)
+            for idx, block in enumerate(model.model.layers):
+                if hasattr(block, "self_attn"):
+                    patched_attn.append((block.self_attn, block.self_attn.forward))
+                    block.self_attn.forward = types.MethodType(ov_model_patcher.deepseek_v3_attn_forward, block.self_attn)
+
+                if hasattr(block, "mlp") and hasattr(block.mlp, "moe") and hasattr(block.mlp, "experts"):
+                    mlp = block.mlp
+                    patched_moe.append((mlp, mlp.forward, mlp.moe))
+                    num_experts = len(mlp.experts)
+                    mlp.gate_projs = torch.concat(
+                        tuple(mlp.experts[i].gate_proj.weight.unsqueeze(0) for i in range(num_experts)),
+                        dim=0,
+                    )
+                    mlp.up_projs = torch.concat(
+                        tuple(mlp.experts[i].up_proj.weight.unsqueeze(0) for i in range(num_experts)),
+                        dim=0,
+                    )
+                    mlp.down_projs = torch.concat(
+                        tuple(mlp.experts[i].down_proj.weight.unsqueeze(0) for i in range(num_experts)),
+                        dim=0,
+                    )
+                    if ov_model_patcher.is_openvino_version("<", "2026.1.0"):
+                        mlp.gate_projs = mlp.gate_projs.float()
+                        mlp.up_projs = mlp.up_projs.float()
+                        mlp.down_projs = mlp.down_projs.float()
+                    mlp.layer_idx = idx
+                    mlp.moe = types.MethodType(ov_model_patcher.deepseek_moe, mlp)
+        yield
+    finally:
+        for module, original_forward in patched_attn:
+            module.forward = original_forward
+        for mlp, original_forward, original_moe in patched_moe:
+            mlp.forward = original_forward
+            mlp.moe = original_moe
+            for attr in ("gate_projs", "up_projs", "down_projs"):
+                if hasattr(mlp, attr):
+                    delattr(mlp, attr)
+
+
 def _forward_logits(model, input_ids: torch.Tensor, attention_mask: torch.Tensor):
     inputs = {
         "input_ids": input_ids.to(getattr(model, "device", "cpu")),
@@ -981,6 +1028,97 @@ def trace_teacher_forced_steps(
     print("Trace completed with matching greedy next-token choices on the shared prefix.")
 
 
+def trace_patched_pytorch_vs_ov_steps(
+    model_id: str,
+    model_dir: str,
+    prompt: str,
+    use_chat_template: bool,
+    steps: int,
+    top_k: int,
+) -> None:
+    model_dir_path = Path(model_dir).expanduser().resolve()
+    if not model_dir_path.exists():
+        raise FileNotFoundError(
+            f"OpenVINO model directory was not found: {model_dir_path}. "
+            "Run `python demo.py export --model-dir ...` first or pass the correct exported model path."
+        )
+
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    patched_model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+    optimized_model = OVModelForCausalLM.from_pretrained(
+        str(model_dir_path),
+        use_cache=True,
+        load_in_8bit=False,
+        quantization_config=None,
+        ov_config=F32_CONFIG,
+    )
+
+    shared_inputs = _prepare_inputs_cpu(tokenizer, prompt, use_chat_template)
+    if "token_type_ids" in shared_inputs:
+        shared_inputs.pop("token_type_ids")
+
+    input_ids = shared_inputs["input_ids"].cpu()
+    attention_mask = shared_inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+    else:
+        attention_mask = attention_mask.cpu()
+
+    with _use_export_pytorch_patches(patched_model):
+        _model_snapshot("patched-pytorch", patched_model, tokenizer, steps)
+        _model_snapshot("openvino", optimized_model, tokenizer, steps)
+
+        print("=========================")
+        print("Patched PyTorch vs OpenVINO teacher-forced trace")
+        print("Prompt:", prompt)
+        print(f"Steps: {steps}")
+        print()
+
+        for step_idx in range(steps):
+            patched_inputs = {
+                "input_ids": input_ids.to(getattr(patched_model, "device", "cpu")),
+                "attention_mask": attention_mask.to(getattr(patched_model, "device", "cpu")),
+            }
+            ov_inputs = {
+                "input_ids": input_ids.to(getattr(optimized_model, "device", "cpu")),
+                "attention_mask": attention_mask.to(getattr(optimized_model, "device", "cpu")),
+            }
+
+            with torch.no_grad():
+                patched_logits = patched_model(**patched_inputs).logits[0, -1].float().cpu()
+                ov_logits = optimized_model(**ov_inputs).logits[0, -1].float().cpu()
+
+            abs_diff = (patched_logits - ov_logits).abs()
+            patched_next = int(patched_logits.argmax().item())
+            ov_next = int(ov_logits.argmax().item())
+            same = patched_next == ov_next
+
+            print(
+                f"step={step_idx} same={same} "
+                f"patched={patched_next}:{repr(tokenizer.decode([patched_next]))} "
+                f"ov={ov_next}:{repr(tokenizer.decode([ov_next]))} "
+                f"max_abs_diff={float(abs_diff.max().item()):.6f}"
+            )
+
+            if not same:
+                patched_topk = torch.topk(patched_logits, k=top_k)
+                ov_topk = torch.topk(ov_logits, k=top_k)
+                print(f"Top-{top_k} patched-pytorch:")
+                for token_id, score in zip(patched_topk.indices.tolist(), patched_topk.values.tolist()):
+                    print(f"  {token_id}: {repr(tokenizer.decode([token_id]))} -> {score:.6f}")
+                print(f"Top-{top_k} openvino:")
+                for token_id, score in zip(ov_topk.indices.tolist(), ov_topk.values.tolist()):
+                    print(f"  {token_id}: {repr(tokenizer.decode([token_id]))} -> {score:.6f}")
+                return
+
+            next_token = torch.tensor([[patched_next]], dtype=input_ids.dtype)
+            next_mask = torch.ones((attention_mask.shape[0], 1), dtype=attention_mask.dtype)
+            input_ids = torch.cat([input_ids, next_token], dim=-1)
+            attention_mask = torch.cat([attention_mask, next_mask], dim=-1)
+
+    print("Trace completed with matching greedy next-token choices on the shared prefix.")
+
+
 def evaluate_model(
     model_id: str,
     model_dir: str,
@@ -1153,6 +1291,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt used for the teacher-forced trace.",
     )
 
+    patched_ov_trace_parser = subparsers.add_parser(
+        "patched-ov-trace",
+        help="Teacher-forced step-by-step trace comparing export-patched PyTorch against OpenVINO.",
+    )
+    patched_ov_trace_parser.add_argument("--model-id", default=DEFAULT_MODEL_ID)
+    patched_ov_trace_parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    patched_ov_trace_parser.add_argument("--use-chat-template", action="store_true")
+    patched_ov_trace_parser.add_argument("--steps", type=int, default=32)
+    patched_ov_trace_parser.add_argument("--top-k", type=int, default=10)
+    patched_ov_trace_parser.add_argument(
+        "--prompt",
+        default=SHORT_PROMPTS[0],
+        help="Prompt used for the patched-PyTorch-vs-OpenVINO teacher-forced trace.",
+    )
+
     attn_debug_parser = subparsers.add_parser(
         "attn-debug",
         help="Compare upstream DeepSeek V3 attention against the export-patched PyTorch attention.",
@@ -1219,6 +1372,17 @@ def main() -> None:
 
     if args.command == "trace":
         trace_teacher_forced_steps(
+            model_id=args.model_id,
+            model_dir=args.model_dir,
+            prompt=args.prompt,
+            use_chat_template=args.use_chat_template,
+            steps=args.steps,
+            top_k=args.top_k,
+        )
+        return
+
+    if args.command == "patched-ov-trace":
+        trace_patched_pytorch_vs_ov_steps(
             model_id=args.model_id,
             model_dir=args.model_dir,
             prompt=args.prompt,
