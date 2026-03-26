@@ -78,6 +78,15 @@ if TYPE_CHECKING:
 
     from optimum.exporters.onnx.config import OnnxConfig
 
+
+DEEPSEEK_MOE_DEBUG_HOOK = None
+
+
+def _deepseek_moe_debug_trace(module, stage: str, **tensors):
+    if DEEPSEEK_MOE_DEBUG_HOOK is None:
+        return
+    DEEPSEEK_MOE_DEBUG_HOOK(module=module, stage=stage, tensors=tensors)
+
 if is_transformers_version(">=", "4.54"):
     from transformers.utils import TransformersKwargs
 else:
@@ -85,13 +94,6 @@ else:
 
 
 logger = logging.getLogger(__name__)
-DEEPSEEK_V3_DEBUG_HOOK = None
-
-
-def _deepseek_v3_debug_trace(module, stage: str, **tensors):
-    if DEEPSEEK_V3_DEBUG_HOOK is None:
-        return
-    DEEPSEEK_V3_DEBUG_HOOK(module=module, stage=stage, tensors=tensors)
 
 
 for idx, spec in enumerate(UNSUPPORTED_OPS_PATCHING_SPEC):
@@ -2995,7 +2997,7 @@ def _decilm_attn_forward(
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
-    def apply_rotary_pos_emb_legacy(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
         """Applies Rotary Position Embedding to the query and key tensors.
 
         Args:
@@ -3902,7 +3904,7 @@ def deepseek_v3_attn_forward(
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
-            **kwargs,
+            kwargs=kwargs,
         )
 
     bsz, q_len, _ = hidden_states.size()
@@ -3937,19 +3939,14 @@ def deepseek_v3_attn_forward(
 
     if new_interface:
         from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
-            ALL_ATTENTION_FUNCTIONS,
             apply_rotary_pos_emb as deepseek_v3_apply_rotary_pos_emb,
-            eager_attention_forward,
+            apply_rotary_pos_emb_interleave as deepseek_v3_apply_rotary_pos_emb_interleave,
         )
 
         cos, sin = position_embeddings
 
         if getattr(self.config, "rope_interleave", False):
             try:
-                from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
-                    apply_rotary_pos_emb_interleave as deepseek_v3_apply_rotary_pos_emb_interleave,
-                )
-
                 q_pe, k_rot = deepseek_v3_apply_rotary_pos_emb_interleave(q_pe, k_rot, cos, sin)
             except Exception as e:
                 raise RuntimeError(
@@ -3985,30 +3982,18 @@ def deepseek_v3_attn_forward(
     k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
     query_states = torch.cat((q_nope, q_pe), dim=-1)
     key_states = torch.cat((k_pass, k_rot), dim=-1)
-    _deepseek_v3_debug_trace(
-        self,
-        "attn_inputs",
-        q_nope=q_nope,
-        q_pe=q_pe,
-        k_pass=k_pass,
-        k_rot=k_rot,
-        query_states=query_states,
-        key_states=key_states,
-        value_states=value_states,
-    )
 
     if kv_cache is not None:
         if new_interface:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
         else:
             cache_kwargs = {"sin": sin, "cos": cos}
-        key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        _deepseek_v3_debug_trace(
-            self,
-            "after_cache",
-            key_states=key_states,
-            value_states=value_states,
-        )
+            key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
     # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
     # Reference: https://github.com/pytorch/pytorch/issues/112577.
@@ -4016,34 +4001,6 @@ def deepseek_v3_attn_forward(
         query_states = query_states.contiguous()
         key_states = key_states.contiguous()
         value_states = value_states.contiguous()
-
-    if new_interface:
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
-            value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
-
-        attention_interface = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
-
-        attn_output, _ = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            **kwargs,
-        )
-
-        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
-            attn_output = attn_output[:, :, :, : self.v_head_dim]
-
-        _deepseek_v3_debug_trace(self, "attn_output_pre_proj", attn_output=attn_output)
-        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
-        _deepseek_v3_debug_trace(self, "attn_output_post_proj", attn_output=attn_output)
-        return attn_output, None
 
     attn_output = torch.nn.functional.scaled_dot_product_attention(
         query_states,
@@ -4053,13 +4010,17 @@ def deepseek_v3_attn_forward(
         dropout_p=self.attention_dropout if self.training else 0.0,
         # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
         is_causal=self.is_causal and attention_mask is None and q_len > 1,
+        scale=None if not new_interface else self.scaling,
     )
 
-    _deepseek_v3_debug_trace(self, "attn_output_pre_proj", attn_output=attn_output)
     attn_output = attn_output.transpose(1, 2).contiguous()
+
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
+
     attn_output = self.o_proj(attn_output)
-    _deepseek_v3_debug_trace(self, "attn_output_post_proj", attn_output=attn_output)
+
+    if new_interface:
+        return attn_output, None
 
     return attn_output, None, past_key_value
 
@@ -4227,7 +4188,6 @@ def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, 
     orig_dtype = hidden_states.dtype
     num_experts = len(self.experts)
     batch_tokens, _ = hidden_states.shape
-    hidden_states = hidden_states.to(self.gate_projs.dtype)
     routing = torch.zeros(batch_tokens, num_experts, dtype=topk_weights.dtype, device=hidden_states.device)
     routing.scatter_(1, topk_indices, topk_weights)
     expanded = hidden_states.unsqueeze(0).expand(num_experts, -1, -1)
@@ -4237,8 +4197,22 @@ def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, 
     gate_up = act_fn(gate) * up
     next_states = torch.bmm(gate_up, self.down_projs.transpose(1, 2))
     routing = routing.transpose(0, 1).unsqueeze(-1)
-    next_states = next_states.to(topk_weights.dtype) * routing
+    _deepseek_moe_debug_trace(
+        self,
+        "moe_inner",
+        hidden_states=hidden_states,
+        topk_indices=topk_indices,
+        topk_weights=topk_weights,
+        routing=routing,
+        gate=gate,
+        up=up,
+        gate_up=gate_up,
+        next_states_pre_routing=next_states,
+    )
+    next_states = next_states * routing
+    _deepseek_moe_debug_trace(self, "moe_inner_post_routing", next_states=next_states)
     next_states = next_states.sum(dim=0)
+    _deepseek_moe_debug_trace(self, "moe_inner_output", next_states=next_states)
     return next_states.to(orig_dtype)
 
 
