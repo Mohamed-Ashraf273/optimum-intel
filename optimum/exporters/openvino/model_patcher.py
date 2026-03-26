@@ -4188,7 +4188,11 @@ def deepseek_moe(self, hidden_states: torch.Tensor, topk_indices: torch.Tensor, 
     orig_dtype = hidden_states.dtype
     num_experts = len(self.experts)
     batch_tokens, _ = hidden_states.shape
-    compute_dtype = torch.promote_types(hidden_states.dtype, self.gate_projs.dtype)
+    # Match the original per-expert path more closely by doing the vectorized
+    # expert math and reduction in fp32, then casting back at the end.
+    compute_dtype = torch.float32 if hidden_states.is_floating_point() else torch.promote_types(
+        hidden_states.dtype, self.gate_projs.dtype
+    )
     routing = torch.zeros(batch_tokens, num_experts, dtype=compute_dtype, device=hidden_states.device)
     routing.scatter_(1, topk_indices, topk_weights.to(dtype=compute_dtype))
     expanded = hidden_states.to(dtype=compute_dtype).unsqueeze(0).expand(num_experts, -1, -1)

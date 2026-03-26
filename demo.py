@@ -343,6 +343,85 @@ def _tensor_diff(left: torch.Tensor, right: torch.Tensor):
     return float(diff.max().item()), float(diff.mean().item())
 
 
+def _capture_layer_mlp_input(model, input_ids: torch.Tensor, attention_mask: torch.Tensor, layer_idx: int) -> torch.Tensor:
+    captured = {}
+
+    def hook(_module, args):
+        captured["hidden_states"] = args[0].detach().clone()
+
+    handle = model.model.layers[layer_idx].mlp.register_forward_pre_hook(hook)
+    try:
+        _forward_logits(model, input_ids, attention_mask)
+    finally:
+        handle.remove()
+
+    if "hidden_states" not in captured:
+        raise RuntimeError(f"Failed to capture MLP input for layer {layer_idx}.")
+    return captured["hidden_states"]
+
+
+def _replay_upstream_moe_layer(model, hidden_states: torch.Tensor, layer_idx: int, recorder: AttentionTraceRecorder):
+    global UPSTREAM_DEEPSEEK_V3_MOE_DEBUG_HOOK
+
+    mlp = model.model.layers[layer_idx].mlp
+    old_hook = UPSTREAM_DEEPSEEK_V3_MOE_DEBUG_HOOK
+    old_forward = mlp.forward
+    old_layer_idx = getattr(mlp, "layer_idx", None)
+    UPSTREAM_DEEPSEEK_V3_MOE_DEBUG_HOOK = recorder
+    try:
+        mlp.layer_idx = layer_idx
+        mlp.forward = types.MethodType(debug_deepseek_v3_moe_forward, mlp)
+        with torch.no_grad():
+            return mlp(hidden_states.to(next(mlp.parameters()).device))
+    finally:
+        mlp.forward = old_forward
+        if old_layer_idx is None:
+            delattr(mlp, "layer_idx")
+        else:
+            mlp.layer_idx = old_layer_idx
+        UPSTREAM_DEEPSEEK_V3_MOE_DEBUG_HOOK = old_hook
+
+
+def _replay_export_moe_layer(model, hidden_states: torch.Tensor, layer_idx: int, recorder: AttentionTraceRecorder):
+    global UPSTREAM_DEEPSEEK_V3_MOE_DEBUG_HOOK
+
+    mlp = model.model.layers[layer_idx].mlp
+    old_hook = UPSTREAM_DEEPSEEK_V3_MOE_DEBUG_HOOK
+    old_export_hook = getattr(ov_model_patcher, "DEEPSEEK_MOE_DEBUG_HOOK", None)
+    old_forward = mlp.forward
+    old_moe = mlp.moe
+    old_layer_idx = getattr(mlp, "layer_idx", None)
+    added_attrs = []
+    UPSTREAM_DEEPSEEK_V3_MOE_DEBUG_HOOK = recorder
+    ov_model_patcher.DEEPSEEK_MOE_DEBUG_HOOK = recorder
+    try:
+        num_experts = len(mlp.experts)
+        gate_projs = torch.concat(tuple(mlp.experts[i].gate_proj.weight.unsqueeze(0) for i in range(num_experts)), dim=0)
+        up_projs = torch.concat(tuple(mlp.experts[i].up_proj.weight.unsqueeze(0) for i in range(num_experts)), dim=0)
+        down_projs = torch.concat(tuple(mlp.experts[i].down_proj.weight.unsqueeze(0) for i in range(num_experts)), dim=0)
+        mlp.gate_projs = gate_projs
+        mlp.up_projs = up_projs
+        mlp.down_projs = down_projs
+        added_attrs.extend(["gate_projs", "up_projs", "down_projs"])
+        mlp.layer_idx = layer_idx
+        mlp.moe = types.MethodType(ov_model_patcher.deepseek_moe, mlp)
+        mlp.forward = types.MethodType(debug_deepseek_v3_moe_forward, mlp)
+        with torch.no_grad():
+            return mlp(hidden_states.to(next(mlp.parameters()).device))
+    finally:
+        mlp.forward = old_forward
+        mlp.moe = old_moe
+        if old_layer_idx is None:
+            delattr(mlp, "layer_idx")
+        else:
+            mlp.layer_idx = old_layer_idx
+        for attr in added_attrs:
+            if hasattr(mlp, attr):
+                delattr(mlp, attr)
+        UPSTREAM_DEEPSEEK_V3_MOE_DEBUG_HOOK = old_hook
+        ov_model_patcher.DEEPSEEK_MOE_DEBUG_HOOK = old_export_hook
+
+
 def compare_export_attention_paths(
     model_id: str,
     prompt: str,
@@ -512,6 +591,34 @@ def compare_export_moe_paths(
     patched_inner_output = patched_recorder.data.get(layer_idx, {}).get("moe_inner_output", {})
     if "next_states" in patched_inner_output:
         print(f"  export-patched reduced next_states: shape={patched_inner_output['next_states']['shape']}")
+
+    print()
+    print(f"Single-layer replay on shared hidden_states for layer {layer_idx}:")
+    shared_hidden_states = _capture_layer_mlp_input(model, input_ids, attention_mask, layer_idx)
+    shared_upstream_recorder = AttentionTraceRecorder()
+    shared_patched_recorder = AttentionTraceRecorder()
+    shared_upstream_output = _replay_upstream_moe_layer(model, shared_hidden_states, layer_idx, shared_upstream_recorder)
+    shared_patched_output = _replay_export_moe_layer(model, shared_hidden_states, layer_idx, shared_patched_recorder)
+    max_abs, mean_abs = _tensor_diff(
+        shared_upstream_output.detach().float().cpu(),
+        shared_patched_output.detach().float().cpu(),
+    )
+    print(f"  output max_abs={max_abs:.6f} mean_abs={mean_abs:.6f}")
+
+    shared_upstream_stage = shared_upstream_recorder.data.get(layer_idx, {}).get("moe", {})
+    shared_patched_stage = shared_patched_recorder.data.get(layer_idx, {}).get("moe", {})
+    for key in ("topk_indices", "topk_weights", "moe_output", "shared_output", "output"):
+        if key not in shared_upstream_stage or key not in shared_patched_stage:
+            continue
+        max_abs, mean_abs = _tensor_diff(shared_upstream_stage[key]["slice"], shared_patched_stage[key]["slice"])
+        print(f"  shared-input {key}: max_abs={max_abs:.6f} mean_abs={mean_abs:.6f}")
+
+    shared_patched_inner = shared_patched_recorder.data.get(layer_idx, {}).get("moe_inner", {})
+    if shared_patched_inner:
+        print("  shared-input export-patched inner tensors:")
+        for key in ("routing", "gate", "up", "gate_up", "next_states_pre_routing"):
+            if key in shared_patched_inner:
+                print(f"    {key}: shape={shared_patched_inner[key]['shape']}")
 
 
 def export_model(model_id: str, model_dir: str, stateful: bool, fp32: bool) -> None:
