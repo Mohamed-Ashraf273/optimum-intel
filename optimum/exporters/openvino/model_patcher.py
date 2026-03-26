@@ -2988,7 +2988,7 @@ def _decilm_attn_forward(
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
-    def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    def apply_rotary_pos_emb_legacy(q, k, cos, sin, position_ids, unsqueeze_dim=1):
         """Applies Rotary Position Embedding to the query and key tensors.
 
         Args:
@@ -3802,11 +3802,8 @@ class DeepseekPatcher(OVDecoderModelPatcher):
                     dim=0,
                 )
 
-                # Handle OpenVINO version check
-                import warnings
-
                 if is_openvino_version("<", "2026.1.0"):
-                    warnings.warn(
+                    logger.warning(
                         "This model works best with OpenVINO 2026.1 or later. "
                         "Earlier versions require float() conversion for MoE weights, "
                         "which may affect performance. "
@@ -3872,16 +3869,17 @@ def deepseek_v3_attn_forward(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     # modified from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L751
     def rotate_half(x):
+        """Rotates half the hidden dims of the input."""
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
     def apply_rotary_pos_emb(q, k, cos, sin, position_ids, unsqueeze_dim=1):
         orig_dtype = k.dtype
-        cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-        sin = sin[position_ids].unsqueeze(unsqueeze_dim)
-        q_fp32 = q.to(dtype=torch.float32)
-        k_fp32 = k.to(dtype=torch.float32)
+        cos = cos[position_ids].unsqueeze(unsqueeze_dim)  # [bs, 1, seq_len, dim]
+        sin = sin[position_ids].unsqueeze(unsqueeze_dim)  # [bs, 1, seq_len, dim]
+        q_fp32 = q.to(dtype=torch.float32, device=q.device)
+        k_fp32 = k.to(dtype=torch.float32, device=k.device)
         q_embed = (q_fp32 * cos) + (rotate_half(q_fp32) * sin)
         k_embed = (k_fp32 * cos) + (rotate_half(k_fp32) * sin)
         return q_embed.to(dtype=orig_dtype), k_embed.to(dtype=orig_dtype)
@@ -3897,7 +3895,7 @@ def deepseek_v3_attn_forward(
             output_attentions=output_attentions,
             use_cache=use_cache,
             cache_position=cache_position,
-            kwargs=kwargs,
+            **kwargs,
         )
 
     bsz, q_len, _ = hidden_states.size()
@@ -3906,9 +3904,9 @@ def deepseek_v3_attn_forward(
         q = self.q_proj(hidden_states)
     else:
         q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
-
     q = q.view(bsz, q_len, self.num_heads, self.qk_head_dim).transpose(1, 2)
     q_nope, q_pe = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+
     compressed_kv = self.kv_a_proj_with_mqa(hidden_states)
 
     k_pass, k_rot = torch.split(
@@ -3931,12 +3929,23 @@ def deepseek_v3_attn_forward(
     new_interface = position_embeddings is not None and not hasattr(self, "rotary_emb")
 
     if new_interface:
-        from transformers.models.deepseek_v3.modeling_deepseek_v3 import apply_rotary_pos_emb_interleave
+        from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
+            ALL_ATTENTION_FUNCTIONS,
+            apply_rotary_pos_emb,
+            apply_rotary_pos_emb_interleave,
+            eager_attention_forward,
+        )
 
         cos, sin = position_embeddings
 
         if getattr(self.config, "rope_interleave", False):
-            q_pe, k_rot = apply_rotary_pos_emb_interleave(q_pe, k_rot, cos, sin)
+            try:
+                q_pe, k_rot = apply_rotary_pos_emb_interleave(q_pe, k_rot, cos, sin)
+            except Exception as e:
+                raise RuntimeError(
+                    "Failed to apply interleaved rotary position embeddings, "
+                    f"may due to incompatible transformers version, try to `pip install transformers>=4.57.1`: {e}"
+                )
         else:
             q_pe, k_rot = apply_rotary_pos_emb(q_pe, k_rot, cos, sin)
 
@@ -3953,7 +3962,7 @@ def deepseek_v3_attn_forward(
                 )
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        q_pe, k_rot = apply_rotary_pos_emb(q_pe, k_rot, cos, sin, position_ids)
+        q_pe, k_rot = apply_rotary_pos_emb_legacy(q_pe, k_rot, cos, sin, position_ids)
 
         if attention_mask is not None:
             if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
@@ -3972,9 +3981,6 @@ def deepseek_v3_attn_forward(
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
-            if attention_mask is not None:
-                attention_mask = attention_mask[:, :, :, : key_states.shape[-2]]
-
         else:
             cache_kwargs = {"sin": sin, "cos": cos}
             key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -3986,6 +3992,32 @@ def deepseek_v3_attn_forward(
         key_states = key_states.contiguous()
         value_states = value_states.contiguous()
 
+    if new_interface:
+        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+            value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
+
+        attention_interface = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        if self.config._attn_implementation == "flash_attention_2" and self.qk_head_dim != self.v_head_dim:
+            attn_output = attn_output[:, :, :, : self.v_head_dim]
+
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, None
+
     attn_output = torch.nn.functional.scaled_dot_product_attention(
         query_states,
         key_states,
@@ -3994,16 +4026,11 @@ def deepseek_v3_attn_forward(
         dropout_p=self.attention_dropout if self.training else 0.0,
         # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
         is_causal=self.is_causal and attention_mask is None and q_len > 1,
-        scale=None if not new_interface else self.scaling,
     )
+
     attn_output = attn_output.transpose(1, 2).contiguous()
-
     attn_output = attn_output.reshape(bsz, q_len, self.num_heads * self.v_head_dim)
-
     attn_output = self.o_proj(attn_output)
-
-    if new_interface:
-        return attn_output, None
 
     return attn_output, None, past_key_value
 
